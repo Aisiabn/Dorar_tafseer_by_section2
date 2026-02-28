@@ -1,0 +1,50 @@
+name: Dorar Structure Extractor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run scraper
+        run: python dorar_structure.py
+        env:
+          TEST_SURAHS: "None"
+
+      - name: Verify output
+        run: |
+          if [ ! -d "dorar_structure" ] || [ -z "$(ls -A dorar_structure)" ]; then
+            echo "ERROR: dorar_structure مفقود أو فارغ"
+            ls -la
+            exit 1
+          fi
+          echo "✔ عدد الملفات: $(ls dorar_structure/ | wc -l)"
+
+      - name: Compress results
+        run: zip -r dorar_structure.zip dorar_structure/
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dorar_structure.zip
+          git diff --cached --quiet || git commit -m "update: structure extracted $(date +'%Y-%m-%d')"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
