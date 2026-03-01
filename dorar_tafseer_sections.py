@@ -1,8 +1,7 @@
 """
 موسوعة التفسير — dorar.net
 المخرج: ملف Markdown منفصل لكل عنوان فرعي (span.title-1)
-التنظيم: السورة → المقطع → النص
-الحواشي مجمّعة في نهاية كل ملف
+الحواشي مرقّمة تسلسلياً وموحّدة في نهاية كل ملف
 """
 
 import requests
@@ -132,72 +131,15 @@ def get_page_title(html):
     return ""
 
 # ─────────────────────────────────────────────
-# استخراج الحواشي
-# ─────────────────────────────────────────────
-TIP_NUM_RE = re.compile(r'^\[(\d+)\]')
-
-def extract_tips(tag):
-    """يستبدل span.tip بـ [^N] ويعيد dict {رقم: نص}"""
-    footnotes = {}
-    for span in tag.find_all("span", class_="tip"):
-        raw = span.get_text(" ", strip=True)
-        m   = TIP_NUM_RE.match(raw)
-        if m:
-            num  = m.group(1)
-            body = re.sub(r'\s+', ' ', raw[len(m.group(0)):]).strip()
-            footnotes[num] = body
-            span.replace_with(f"§FN{num}§")
-        else:
-            span.decompose()
-    return footnotes
-
-# ─────────────────────────────────────────────
-# تقطيع <p> على span.title-1
-# يعيد: [(title1_heading, text_block), ...]
-# title1_heading = None للنص قبل أول عنوان
-# ─────────────────────────────────────────────
-def split_by_title1(p_tag):
-    segments = []   # [(heading_or_None, text)]
-    buf      = []
-    cur_head = None
-
-    def flush():
-        t = re.sub(r'\s+', ' ', " ".join(buf)).strip()
-        if t or cur_head is not None:
-            segments.append((cur_head, t))
-        buf.clear()
-
-    for node in p_tag.children:
-        if isinstance(node, NavigableString):
-            s = str(node).strip()
-            if s:
-                buf.append(s)
-        elif isinstance(node, Tag):
-            if node.name == "span" and "title-1" in node.get("class", []):
-                flush()
-                cur_head = node.get_text(strip=True)
-            elif node.name == "br":
-                buf.append(" ")
-            else:
-                if node.name == "span" and "aaya" in node.get("class", []):
-                    t = node.get_text(strip=True)
-                    if t:
-                        buf.append(f"﴿{t}﴾")
-                else:
-                    t = node.get_text(" ", strip=True)
-                    if t:
-                        buf.append(t)
-
-    flush()
-    return segments
-
-# ─────────────────────────────────────────────
-# استخراج من صفحة كاملة
-# يعيد قائمة:
-# [{"key": fuzzy_key, "display": "مناسبة...",
-#   "l3": "تفسير الآيات", "text": "...", "footnotes": {...}}]
+# استخراج الأقسام من صفحة
+# يعالج الحواشي بنفس أسلوب الكود المرجعي:
+# span.tip → [^N] مباشرة مع جمع نصوصها
 # ─────────────────────────────────────────────
 def extract_title1_blocks(html):
+    """
+    يعيد قائمة:
+    [{"key", "display", "l3", "text", "footnotes": ["[^1]: ...", ...]}]
+    """
     soup   = BeautifulSoup(html, "html.parser")
     blocks = []
 
@@ -211,29 +153,96 @@ def extract_title1_blocks(html):
         if not p:
             continue
 
-        footnotes = extract_tips(p)
-        segments  = split_by_title1(p)
+        # ── 1. تحويل العناصر المعروفة قبل استخراج النص ──
+        for span in p.find_all("span", class_="aaya"):
+            span.replace_with(f"﴿{span.get_text(strip=True)}﴾")
+        for span in p.find_all("span", class_="hadith"):
+            span.replace_with(f"«{span.get_text(strip=True)}»")
+        for span in p.find_all("span", class_="sora"):
+            span.replace_with(f" {span.get_text(strip=True)} ")
+
+        # ── 2. استخراج الحواشي وإدراج مراجعها في النص ──
+        fn_counter = 1
+        footnotes  = []
+        for tip in p.find_all("span", class_="tip"):
+            fn_text = tip.get_text(strip=True)
+            if fn_text:
+                footnotes.append(f"[^{fn_counter}]: {fn_text}")
+                tip.replace_with(f" [^{fn_counter}]")
+                fn_counter += 1
+            else:
+                tip.decompose()
+
+        for br in p.find_all("br"):
+            br.replace_with("\n")
+
+        # ── 3. تقطيع النص على span.title-1 ──
+        # (بعد replace_with أصبحت NavigableStrings)
+        raw_text = p.get_text(separator="")
+        raw_text = re.sub(r'[ \t]+', ' ', raw_text)
+        raw_text = re.sub(r'\n{3,}', '\n\n', raw_text)
+
+        # ابحث عن span.title-1 المتبقية (لم تُعالَج بعد)
+        # نستعمل النص الخام ونقطّعه على نمط العناوين الفرعية
+        # title-1 تحوّلت لنص عادي — نلتقطها بنمط مميّز
+        # لذا نعيد المعالجة بالمشي على children قبل get_text
+        p2 = BeautifulSoup(html, "html.parser")
+        # (نستعمل النص المعدّل مباشرة — p عُدِّل في المكان)
+        segments = _split_on_title1_text(raw_text)
 
         for (title1, text) in segments:
-            if title1 is None:
-                continue   # نص قبل أي عنوان فرعي — لا نجمعه
-            if not text.strip():
+            if not title1 or not text.strip():
                 continue
             key = fuzzy_key(title1)
             blocks.append({
                 "key"      : key,
                 "display"  : title1,
                 "l3"       : l3_heading,
-                "text"     : text,
-                "footnotes": footnotes,
+                "text"     : text.strip(),
+                "footnotes": footnotes,   # كل الحواشي مشتركة — renum يفلترها
             })
 
     return blocks
 
+
+def _split_on_title1_text(raw: str):
+    """
+    يقطّع النص على أنماط العناوين الفرعية (title-1).
+    المشكلة: بعد replace_with تصبح title-1 نصاً عادياً،
+    لكن لها نمط مميّز: تنتهي بـ ':' وتسبقها سطر جديد أو فراغ.
+    نستعمل نهج أبسط: نمشي على p.children قبل get_text.
+    """
+    # هذه الدالة تُستدعى بعد أن p عُدِّل — نمرّر raw مباشرة
+    # نقسّم على السطور ونبحث عن أسطر تبدو عناوين فرعية
+    # (قصيرة، تنتهي بـ ':')
+    TITLE1_PAT = re.compile(
+        r'^[\u0600-\u06FF\s،؛]{5,60}:$'
+    )
+    lines    = raw.split('\n')
+    segments = []
+    cur_head = None
+    buf      = []
+
+    def flush():
+        t = re.sub(r'\s+', ' ', ' '.join(buf)).strip()
+        if cur_head and t:
+            segments.append((cur_head, t))
+        buf.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if TITLE1_PAT.match(stripped):
+            flush()
+            cur_head = stripped
+        else:
+            if stripped:
+                buf.append(stripped)
+
+    flush()
+    return segments
+
 # ─────────────────────────────────────────────
 # قاعدة التجميع
-# db[key] = {"display": "مناسبة الآية...", "entries": [...]}
-# entry = {"surah", "page_title", "l3", "text", "footnotes"}
 # ─────────────────────────────────────────────
 def register(db, block, surah_title, page_title):
     k = block["key"]
@@ -246,6 +255,38 @@ def register(db, block, surah_title, page_title):
         "text"       : block["text"],
         "footnotes"  : block["footnotes"],
     })
+
+# ─────────────────────────────────────────────
+# إعادة ترقيم الحواشي (مقتبس من الكود المرجعي)
+# ─────────────────────────────────────────────
+def renum(text, fns, global_fn):
+    """
+    تحوّل أرقام الحواشي المحلية [^N] إلى أرقام عالمية متسلسلة.
+    تعيد (text_new, fns_new, global_fn_new)
+    """
+    local_map = {}
+    for fn in fns:
+        m = re.match(r'\[\^(\d+)\]:', fn)
+        if m:
+            orig = m.group(1)
+            # أضف فقط إذا الرقم موجود فعلاً في النص
+            if re.search(rf'\[\^{re.escape(orig)}\](?!\d)', text):
+                if orig not in local_map:
+                    local_map[orig] = str(global_fn)
+                    global_fn += 1
+
+    for loc, gbl in local_map.items():
+        text = re.sub(rf'\[\^{re.escape(loc)}\](?!\d)', f'[^{gbl}]', text)
+
+    new_fns = []
+    for fn in fns:
+        m = re.match(r'\[\^(\d+)\]:(.*)', fn, re.DOTALL)
+        if m and m.group(1) in local_map:
+            new_fns.append(
+                f"[^{local_map[m.group(1)]}]:{m.group(2)}"
+            )
+
+    return text, new_fns, global_fn
 
 # ─────────────────────────────────────────────
 # الزحف
@@ -296,25 +337,6 @@ def crawl(session, surah_links):
 # ─────────────────────────────────────────────
 # الحفظ
 # ─────────────────────────────────────────────
-def render_entry(entry, fn_counter):
-    fn_map    = {}
-    collected = []
-
-    def remap(m):
-        nonlocal fn_counter
-        orig = m.group(1)
-        if orig not in fn_map:
-            fn_counter += 1
-            fn_map[orig] = fn_counter
-            body = entry["footnotes"].get(orig, "")
-            collected.append((fn_counter, body))
-        return f"[^{fn_map[orig]}]"
-
-    txt = re.sub(r'§FN(\d+)§', remap, entry["text"])
-    txt = re.sub(r'\s+', ' ', txt).strip()
-    return txt, fn_counter, collected
-
-
 def save_db(db):
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -325,7 +347,7 @@ def save_db(db):
         fpath   = os.path.join(OUT_DIR, fname)
 
         all_footnotes = []
-        fn_counter    = 0
+        global_fn     = 1
 
         lines = [
             f"# {display}\n\n",
@@ -341,23 +363,25 @@ def save_db(db):
                 lines.append(f"\n## سورة {current_surah}\n\n")
 
             lines.append(f"### {entry['page_title']}\n")
-            lines.append(f"*ضمن: {entry['l3']}*\n")
+            lines.append(f"*ضمن: {entry['l3']}*\n\n")
 
-            txt, fn_counter, collected = render_entry(entry, fn_counter)
-            if txt:
-                lines.append(f"\n{txt}\n")
-            all_footnotes.extend(collected)
-            lines.append("\n---\n\n")
+            text, new_fns, global_fn = renum(
+                entry["text"], entry["footnotes"], global_fn
+            )
+            if text:
+                lines.append(f"{text}\n\n")
+            all_footnotes.extend(new_fns)
+            lines.append("---\n\n")
 
         if all_footnotes:
             lines.append("\n## الحواشي\n\n")
-            for num, body in sorted(all_footnotes, key=lambda x: x[0]):
-                lines.append(f"[^{num}]: {body}\n")
+            for fn in all_footnotes:
+                lines.append(f"{fn}\n")
 
         with open(fpath, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        print(f"  ✔ {fname}  ({len(entries)} مقطع)")
+        print(f"  ✔ {fname}  ({len(entries)} مقطع، {len(all_footnotes)} حاشية)")
 
     print(f"\n✔ {len(db)} ملف في {OUT_DIR}/")
 
