@@ -5,7 +5,7 @@
 """
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
 import re, time, os, traceback
 from difflib import SequenceMatcher
 
@@ -23,6 +23,8 @@ SECTION_RE = re.compile(r"^/tafseer/(\d+)/(\d+)$")
 TASHKEEL = re.compile(
     r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]'
 )
+
+MARKER = "\x00T1\x00"   # علامة فريدة للتقسيم
 
 # ─────────────────────────────────────────────
 # أدوات مساعدة
@@ -132,12 +134,10 @@ def get_page_title(html):
 
 # ─────────────────────────────────────────────
 # استخراج الأقسام من صفحة
-# يعالج الحواشي بنفس أسلوب الكود المرجعي:
-# span.tip → [^N] مباشرة مع جمع نصوصها
 # ─────────────────────────────────────────────
 def extract_title1_blocks(html):
     """
-    يعيد قائمة:
+    يعيد:
     [{"key", "display", "l3", "text", "footnotes": ["[^1]: ...", ...]}]
     """
     soup   = BeautifulSoup(html, "html.parser")
@@ -153,7 +153,12 @@ def extract_title1_blocks(html):
         if not p:
             continue
 
-        # ── 1. تحويل العناصر المعروفة قبل استخراج النص ──
+        # ── 1. علّم title-1 أولاً قبل أي شيء ──
+        for span in p.find_all("span", class_="title-1"):
+            title_text = span.get_text(strip=True)
+            span.replace_with(f"\n{MARKER}{title_text}{MARKER}\n")
+
+        # ── 2. تحويل العناصر الأخرى ──
         for span in p.find_all("span", class_="aaya"):
             span.replace_with(f"﴿{span.get_text(strip=True)}﴾")
         for span in p.find_all("span", class_="hadith"):
@@ -161,7 +166,7 @@ def extract_title1_blocks(html):
         for span in p.find_all("span", class_="sora"):
             span.replace_with(f" {span.get_text(strip=True)} ")
 
-        # ── 2. استخراج الحواشي وإدراج مراجعها في النص ──
+        # ── 3. استخراج الحواشي ──
         fn_counter = 1
         footnotes  = []
         for tip in p.find_all("span", class_="tip"):
@@ -176,70 +181,62 @@ def extract_title1_blocks(html):
         for br in p.find_all("br"):
             br.replace_with("\n")
 
-        # ── 3. تقطيع النص على span.title-1 ──
-        # (بعد replace_with أصبحت NavigableStrings)
-        raw_text = p.get_text(separator="")
-        raw_text = re.sub(r'[ \t]+', ' ', raw_text)
-        raw_text = re.sub(r'\n{3,}', '\n\n', raw_text)
+        # ── 4. استخراج النص والتقسيم على العلامة ──
+        raw = p.get_text(separator="")
+        raw = re.sub(r'[ \t]+', ' ', raw)
 
-        # ابحث عن span.title-1 المتبقية (لم تُعالَج بعد)
-        # نستعمل النص الخام ونقطّعه على نمط العناوين الفرعية
-        # title-1 تحوّلت لنص عادي — نلتقطها بنمط مميّز
-        # لذا نعيد المعالجة بالمشي على children قبل get_text
-        p2 = BeautifulSoup(html, "html.parser")
-        # (نستعمل النص المعدّل مباشرة — p عُدِّل في المكان)
-        segments = _split_on_title1_text(raw_text)
+        SPLIT_RE = re.compile(
+            re.escape(MARKER) + r'(.*?)' + re.escape(MARKER),
+            re.DOTALL
+        )
+        parts = SPLIT_RE.split(raw)
+        # parts = [قبل_أول_عنوان, عنوان1, نص1, عنوان2, نص2, ...]
 
-        for (title1, text) in segments:
-            if not title1 or not text.strip():
+        i = 1
+        while i < len(parts) - 1:
+            title1 = parts[i].strip()
+            text   = parts[i + 1] if i + 1 < len(parts) else ""
+            text   = re.sub(r'\n{3,}', '\n\n', text).strip()
+            i += 2
+
+            if not title1 or not text:
                 continue
+
             key = fuzzy_key(title1)
             blocks.append({
                 "key"      : key,
                 "display"  : title1,
                 "l3"       : l3_heading,
-                "text"     : text.strip(),
-                "footnotes": footnotes,   # كل الحواشي مشتركة — renum يفلترها
+                "text"     : text,
+                "footnotes": footnotes,
             })
 
     return blocks
 
+# ─────────────────────────────────────────────
+# إعادة الترقيم (من الكود المرجعي)
+# ─────────────────────────────────────────────
+def renum(text, fns, global_fn):
+    local_map = {}
+    for fn in fns:
+        m = re.match(r'\[\^(\d+)\]:', fn)
+        if m:
+            orig = m.group(1)
+            if re.search(rf'\[\^{re.escape(orig)}\](?!\d)', text):
+                if orig not in local_map:
+                    local_map[orig] = str(global_fn)
+                    global_fn += 1
 
-def _split_on_title1_text(raw: str):
-    """
-    يقطّع النص على أنماط العناوين الفرعية (title-1).
-    المشكلة: بعد replace_with تصبح title-1 نصاً عادياً،
-    لكن لها نمط مميّز: تنتهي بـ ':' وتسبقها سطر جديد أو فراغ.
-    نستعمل نهج أبسط: نمشي على p.children قبل get_text.
-    """
-    # هذه الدالة تُستدعى بعد أن p عُدِّل — نمرّر raw مباشرة
-    # نقسّم على السطور ونبحث عن أسطر تبدو عناوين فرعية
-    # (قصيرة، تنتهي بـ ':')
-    TITLE1_PAT = re.compile(
-        r'^[\u0600-\u06FF\s،؛]{5,60}:$'
-    )
-    lines    = raw.split('\n')
-    segments = []
-    cur_head = None
-    buf      = []
+    for loc, gbl in local_map.items():
+        text = re.sub(rf'\[\^{re.escape(loc)}\](?!\d)', f'[^{gbl}]', text)
 
-    def flush():
-        t = re.sub(r'\s+', ' ', ' '.join(buf)).strip()
-        if cur_head and t:
-            segments.append((cur_head, t))
-        buf.clear()
+    new_fns = []
+    for fn in fns:
+        m = re.match(r'\[\^(\d+)\]:(.*)', fn, re.DOTALL)
+        if m and m.group(1) in local_map:
+            new_fns.append(f"[^{local_map[m.group(1)]}]:{m.group(2)}")
 
-    for line in lines:
-        stripped = line.strip()
-        if TITLE1_PAT.match(stripped):
-            flush()
-            cur_head = stripped
-        else:
-            if stripped:
-                buf.append(stripped)
-
-    flush()
-    return segments
+    return text, new_fns, global_fn
 
 # ─────────────────────────────────────────────
 # قاعدة التجميع
@@ -255,38 +252,6 @@ def register(db, block, surah_title, page_title):
         "text"       : block["text"],
         "footnotes"  : block["footnotes"],
     })
-
-# ─────────────────────────────────────────────
-# إعادة ترقيم الحواشي (مقتبس من الكود المرجعي)
-# ─────────────────────────────────────────────
-def renum(text, fns, global_fn):
-    """
-    تحوّل أرقام الحواشي المحلية [^N] إلى أرقام عالمية متسلسلة.
-    تعيد (text_new, fns_new, global_fn_new)
-    """
-    local_map = {}
-    for fn in fns:
-        m = re.match(r'\[\^(\d+)\]:', fn)
-        if m:
-            orig = m.group(1)
-            # أضف فقط إذا الرقم موجود فعلاً في النص
-            if re.search(rf'\[\^{re.escape(orig)}\](?!\d)', text):
-                if orig not in local_map:
-                    local_map[orig] = str(global_fn)
-                    global_fn += 1
-
-    for loc, gbl in local_map.items():
-        text = re.sub(rf'\[\^{re.escape(loc)}\](?!\d)', f'[^{gbl}]', text)
-
-    new_fns = []
-    for fn in fns:
-        m = re.match(r'\[\^(\d+)\]:(.*)', fn, re.DOTALL)
-        if m and m.group(1) in local_map:
-            new_fns.append(
-                f"[^{local_map[m.group(1)]}]:{m.group(2)}"
-            )
-
-    return text, new_fns, global_fn
 
 # ─────────────────────────────────────────────
 # الزحف
