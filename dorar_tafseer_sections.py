@@ -1,11 +1,11 @@
 """
 موسوعة التفسير — dorar.net
 المخرج: ملف Markdown منفصل لكل عنوان فرعي (span.title-1)
-الحواشي مرقّمة تسلسلياً وموحّدة في نهاية كل ملف
+كل segment يستخرج حواشيه بشكل مستقل — لا مشاركة بين الأقسام
 """
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 import re, time, os, traceback
 from difflib import SequenceMatcher
 
@@ -19,12 +19,9 @@ TEST_SURAHS = None if _val == "None" else int(_val)
 
 SURAH_RE   = re.compile(r"^/tafseer/(\d+)$")
 SECTION_RE = re.compile(r"^/tafseer/(\d+)/(\d+)$")
-
-TASHKEEL = re.compile(
+TASHKEEL   = re.compile(
     r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]'
 )
-
-MARKER = "\x00T1\x00"   # علامة فريدة للتقسيم
 
 # ─────────────────────────────────────────────
 # أدوات مساعدة
@@ -35,25 +32,23 @@ def normalize(text):
     text = TASHKEEL.sub('', text)
     text = re.sub(r'[أإآٱ]', 'ا', text)
     text = re.sub(r'ى', 'ي', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+    return re.sub(r'\s+', ' ', text).strip()
 
-def fuzzy_key(heading: str, threshold: float = 0.82) -> str:
+def fuzzy_key(heading, threshold=0.82):
     norm = normalize(heading)
     best_score, best_key = 0.0, None
     for k in _known_keys:
-        score = SequenceMatcher(None, norm, k).ratio()
-        if score > best_score:
-            best_score, best_key = score, k
+        s = SequenceMatcher(None, norm, k).ratio()
+        if s > best_score:
+            best_score, best_key = s, k
     if best_score >= threshold:
         return best_key
     _known_keys.append(norm)
     return norm
 
-def safe_filename(text: str) -> str:
+def safe_filename(text):
     text = TASHKEEL.sub('', text)
-    text = re.sub(r'[\\/:*?"<>|]', '', text)
-    text = text.strip().rstrip(':').strip()
+    text = re.sub(r'[\\/:*?"<>|]', '', text).strip().rstrip(':').strip()
     return text[:80] or "قسم"
 
 # ─────────────────────────────────────────────
@@ -65,8 +60,7 @@ def make_session():
         "User-Agent"               : "Mozilla/5.0 (Windows NT 6.1; WOW64) "
                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
                                      "Chrome/109.0.0.0 Safari/537.36",
-        "Accept"                   : "text/html,application/xhtml+xml,application/xml;"
-                                     "q=0.9,image/webp,*/*;q=0.8",
+        "Accept"                   : "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language"          : "ar,en-US;q=0.9,en;q=0.8",
         "Connection"               : "keep-alive",
         "Upgrade-Insecure-Requests": "1",
@@ -105,14 +99,14 @@ def get_surah_links(html):
 
 def get_first_section_link(html, surah_num):
     soup = BeautifulSoup(html, "html.parser")
-    candidates = []
+    cands = []
     for a in soup.find_all("a", href=SECTION_RE):
         m = SECTION_RE.match(a["href"])
         if m and int(m.group(1)) == surah_num:
-            candidates.append((int(m.group(2)), BASE + a["href"]))
-    if candidates:
-        candidates.sort()
-        return candidates[0][1]
+            cands.append((int(m.group(2)), BASE + a["href"]))
+    if cands:
+        cands.sort()
+        return cands[0][1]
     return None
 
 def get_next_link(html):
@@ -133,13 +127,52 @@ def get_page_title(html):
     return ""
 
 # ─────────────────────────────────────────────
+# معالجة nodes مستقلة لكل segment
+# ─────────────────────────────────────────────
+def process_nodes(nodes):
+    """
+    يحوّل قائمة nodes مباشرة إلى (text, footnotes).
+    الحواشي مرقّمة محلياً من 1 — مستقلة تماماً عن باقي الأقسام.
+    """
+    fn_counter = 1
+    footnotes  = []
+    parts      = []
+
+    for node in nodes:
+        if isinstance(node, NavigableString):
+            parts.append(str(node))
+        elif isinstance(node, Tag):
+            cls = node.get("class", [])
+            if node.name == "br":
+                parts.append("\n")
+            elif "tip" in cls:
+                fn_text = node.get_text(strip=True)
+                if fn_text:
+                    footnotes.append(f"[^{fn_counter}]: {fn_text}")
+                    parts.append(f" [^{fn_counter}]")
+                    fn_counter += 1
+            elif "aaya" in cls:
+                parts.append(f"﴿{node.get_text(strip=True)}﴾")
+            elif "hadith" in cls:
+                parts.append(f"«{node.get_text(strip=True)}»")
+            elif "sora" in cls:
+                t = node.get_text(strip=True)
+                if t:
+                    parts.append(f" {t} ")
+            elif "title-1" in cls:
+                pass  # لا يجب أن يصل هنا
+            else:
+                parts.append(node.get_text(" ", strip=False))
+
+    text = "".join(parts)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return text, footnotes
+
+# ─────────────────────────────────────────────
 # استخراج الأقسام من صفحة
 # ─────────────────────────────────────────────
 def extract_title1_blocks(html):
-    """
-    يعيد:
-    [{"key", "display", "l3", "text", "footnotes": ["[^1]: ...", ...]}]
-    """
     soup   = BeautifulSoup(html, "html.parser")
     blocks = []
 
@@ -153,59 +186,39 @@ def extract_title1_blocks(html):
         if not p:
             continue
 
-        # ── 1. علّم title-1 أولاً قبل أي شيء ──
-        for span in p.find_all("span", class_="title-1"):
-            title_text = span.get_text(strip=True)
-            span.replace_with(f"\n{MARKER}{title_text}{MARKER}\n")
+        # جمع كل title-1 مباشرة في p
+        t1_spans = [
+            n for n in p.children
+            if isinstance(n, Tag) and "title-1" in n.get("class", [])
+        ]
+        if not t1_spans:
+            continue
 
-        # ── 2. تحويل العناصر الأخرى ──
-        for span in p.find_all("span", class_="aaya"):
-            span.replace_with(f"﴿{span.get_text(strip=True)}﴾")
-        for span in p.find_all("span", class_="hadith"):
-            span.replace_with(f"«{span.get_text(strip=True)}»")
-        for span in p.find_all("span", class_="sora"):
-            span.replace_with(f" {span.get_text(strip=True)} ")
+        # بناء خريطة: t1_span → الـ nodes التي تليه حتى t1 التالي
+        t1_set = set(id(s) for s in t1_spans)
 
-        # ── 3. استخراج الحواشي ──
-        fn_counter = 1
-        footnotes  = []
-        for tip in p.find_all("span", class_="tip"):
-            fn_text = tip.get_text(strip=True)
-            if fn_text:
-                footnotes.append(f"[^{fn_counter}]: {fn_text}")
-                tip.replace_with(f" [^{fn_counter}]")
-                fn_counter += 1
-            else:
-                tip.decompose()
-
-        for br in p.find_all("br"):
-            br.replace_with("\n")
-
-        # ── 4. استخراج النص والتقسيم على العلامة ──
-        raw = p.get_text(separator="")
-        raw = re.sub(r'[ \t]+', ' ', raw)
-
-        SPLIT_RE = re.compile(
-            re.escape(MARKER) + r'(.*?)' + re.escape(MARKER),
-            re.DOTALL
-        )
-        parts = SPLIT_RE.split(raw)
-        # parts = [قبل_أول_عنوان, عنوان1, نص1, عنوان2, نص2, ...]
-
-        i = 1
-        while i < len(parts) - 1:
-            title1 = parts[i].strip()
-            text   = parts[i + 1] if i + 1 < len(parts) else ""
-            text   = re.sub(r'\n{3,}', '\n\n', text).strip()
-            i += 2
-
-            if not title1 or not text:
+        for idx, t1 in enumerate(t1_spans):
+            title_text = t1.get_text(strip=True)
+            if not title_text:
                 continue
 
-            key = fuzzy_key(title1)
+            # اجمع siblings حتى t1 التالي
+            seg_nodes = []
+            node = t1.next_sibling
+            while node is not None:
+                if isinstance(node, Tag) and id(node) in t1_set:
+                    break
+                seg_nodes.append(node)
+                node = node.next_sibling
+
+            text, footnotes = process_nodes(seg_nodes)
+            if not text:
+                continue
+
+            key = fuzzy_key(title_text)
             blocks.append({
                 "key"      : key,
-                "display"  : title1,
+                "display"  : title_text,
                 "l3"       : l3_heading,
                 "text"     : text,
                 "footnotes": footnotes,
@@ -214,27 +227,32 @@ def extract_title1_blocks(html):
     return blocks
 
 # ─────────────────────────────────────────────
-# إعادة الترقيم (من الكود المرجعي)
+# إعادة الترقيم العالمي
 # ─────────────────────────────────────────────
 def renum(text, fns, global_fn):
+    """
+    الحواشي محلية [^1],[^2],... — نعيد ترقيمها عالمياً.
+    كل رقم في النص له بالضرورة تعريف في fns لأنهما أُنشئا معاً.
+    """
     local_map = {}
     for fn in fns:
         m = re.match(r'\[\^(\d+)\]:', fn)
         if m:
             orig = m.group(1)
-            if re.search(rf'\[\^{re.escape(orig)}\](?!\d)', text):
-                if orig not in local_map:
-                    local_map[orig] = str(global_fn)
-                    global_fn += 1
+            if orig not in local_map:
+                local_map[orig] = str(global_fn)
+                global_fn += 1
 
     for loc, gbl in local_map.items():
-        text = re.sub(rf'\[\^{re.escape(loc)}\](?!\d)', f'[^{gbl}]', text)
+        text = re.sub(rf'\[\^{re.escape(loc)}\]', f'[^{gbl}]', text)
 
     new_fns = []
     for fn in fns:
         m = re.match(r'\[\^(\d+)\]:(.*)', fn, re.DOTALL)
-        if m and m.group(1) in local_map:
-            new_fns.append(f"[^{local_map[m.group(1)]}]:{m.group(2)}")
+        if m:
+            gbl = local_map.get(m.group(1))
+            if gbl:
+                new_fns.append(f"[^{gbl}]:{m.group(2)}")
 
     return text, new_fns, global_fn
 
@@ -258,14 +276,9 @@ def register(db, block, surah_title, page_title):
 # ─────────────────────────────────────────────
 def crawl(session, surah_links):
     db = {}
-
     for surah in surah_links:
-        snum   = surah["num"]
-        stitle = surah["title"]
-        surl   = surah["url"]
-
-        print(f"\n{'='*55}")
-        print(f"[{snum:3d}] {stitle}")
+        snum, stitle, surl = surah["num"], surah["title"], surah["url"]
+        print(f"\n{'='*55}\n[{snum:3d}] {stitle}")
 
         html_s = get_page(session, surl, referer=INDEX)
         time.sleep(DELAY)
@@ -280,21 +293,17 @@ def crawl(session, surah_links):
             print("  ⚠ لا مقاطع")
             continue
 
-        next_url = first_url
-        visited  = set()
-
+        next_url, visited = first_url, set()
         while next_url and next_url not in visited:
             visited.add(next_url)
             html_p = get_page(session, next_url, referer=surl)
             time.sleep(DELAY)
             if not html_p:
                 break
-
             ptitle = get_page_title(html_p)
             for blk in extract_title1_blocks(html_p):
                 register(db, blk, stitle, ptitle)
                 print(f"    {ptitle[:35]:35s}  → {blk['display'][:30]}")
-
             next_url = get_next_link(html_p)
 
     return db
@@ -306,10 +315,8 @@ def save_db(db):
     os.makedirs(OUT_DIR, exist_ok=True)
 
     for key, info in db.items():
-        display = info["display"]
-        entries = info["entries"]
-        fname   = safe_filename(display) + ".md"
-        fpath   = os.path.join(OUT_DIR, fname)
+        display, entries = info["display"], info["entries"]
+        fpath = os.path.join(OUT_DIR, safe_filename(display) + ".md")
 
         all_footnotes = []
         global_fn     = 1
@@ -346,7 +353,7 @@ def save_db(db):
         with open(fpath, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        print(f"  ✔ {fname}  ({len(entries)} مقطع، {len(all_footnotes)} حاشية)")
+        print(f"  ✔ {safe_filename(display)}.md  ({len(entries)} مقطع، {len(all_footnotes)} حاشية)")
 
     print(f"\n✔ {len(db)} ملف في {OUT_DIR}/")
 
@@ -356,7 +363,6 @@ def save_db(db):
 if __name__ == "__main__":
     try:
         session = make_session()
-
         print("① تهيئة الجلسة...")
         get_page(session, INDEX, referer=BASE)
         time.sleep(1.5)
@@ -369,7 +375,6 @@ if __name__ == "__main__":
 
         surah_links = get_surah_links(html_main)
         print(f"\n③ {len(surah_links)} سورة مكتشفة")
-
         if TEST_SURAHS:
             surah_links = surah_links[:TEST_SURAHS]
 
@@ -378,7 +383,6 @@ if __name__ == "__main__":
 
         print("\n⑤ الحفظ...")
         save_db(db)
-
         print("\n✔ اكتمل.")
 
     except SystemExit as e:
