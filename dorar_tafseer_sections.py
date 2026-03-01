@@ -13,10 +13,10 @@ from difflib import SequenceMatcher
 BASE    = "https://dorar.net"
 INDEX   = "https://dorar.net/tafseer"
 DELAY   = 1.2
-OUT_DIR = "dorar_structure"
+OUT_DIR = "dorar_tafseer_sections"
 
 _val        = os.environ.get("TEST_SURAHS", "None")
-TEST_SURAHS = 1 if _val == "None" else int(_val)
+TEST_SURAHS = None if _val == "None" else int(_val)
 
 SURAH_RE   = re.compile(r"^/tafseer/(\d+)$")
 SECTION_RE = re.compile(r"^/tafseer/(\d+)/(\d+)$")
