@@ -146,7 +146,7 @@ def extract_tips(tag):
             num  = m.group(1)
             body = re.sub(r'\s+', ' ', raw[len(m.group(0)):]).strip()
             footnotes[num] = body
-            span.replace_with(f"[^{num}]")
+            span.replace_with(f" [^{num}] ")
         else:
             span.decompose()
     return footnotes
