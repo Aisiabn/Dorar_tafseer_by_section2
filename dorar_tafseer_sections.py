@@ -179,9 +179,14 @@ def split_by_title1(p_tag):
             elif node.name == "br":
                 buf.append(" ")
             else:
-                t = node.get_text(" ", strip=True)
-                if t:
-                    buf.append(t)
+                if node.name == "span" and "aaya" in node.get("class", []):
+                    t = node.get_text(strip=True)
+                    if t:
+                        buf.append(f"﴿{t}﴾")
+                else:
+                    t = node.get_text(" ", strip=True)
+                    if t:
+                        buf.append(t)
 
     flush()
     return segments
