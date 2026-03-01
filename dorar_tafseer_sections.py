@@ -146,7 +146,7 @@ def extract_tips(tag):
             num  = m.group(1)
             body = re.sub(r'\s+', ' ', raw[len(m.group(0)):]).strip()
             footnotes[num] = body
-            span.replace_with(f" [^{num}] ")
+            span.replace_with(f"§FN{num}§")
         else:
             span.decompose()
     return footnotes
@@ -310,7 +310,7 @@ def render_entry(entry, fn_counter):
             collected.append((fn_counter, body))
         return f"[^{fn_map[orig]}]"
 
-    txt = re.sub(r'\[\^(\d+)\]', remap, entry["text"])
+    txt = re.sub(r'§FN(\d+)§', remap, entry["text"])
     txt = re.sub(r'\s+', ' ', txt).strip()
     return txt, fn_counter, collected
 
