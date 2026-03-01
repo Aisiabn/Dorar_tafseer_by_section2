@@ -20,7 +20,9 @@ INDEX   = "https://dorar.net/tafseer"
 DELAY   = 1.2
 OUT_DIR = "dorar_structure"
 
-TEST_SURAHS = None  # None = كل القرآن
+# ── إصلاح: قراءة TEST_SURAHS من البيئة إن وُجدت ──
+_val = os.environ.get("TEST_SURAHS", "None")
+TEST_SURAHS = None if _val == "None" else int(_val)
 
 
 # ─────────────────────────────────────────────
@@ -155,10 +157,6 @@ def get_page_title(html):
 # ─────────────────────────────────────────────
 
 def extract_structure(html):
-    """
-    يستهدف h5 بـ class يحتوي على default-text-color مباشرة
-    — يتجنب modal/footer تلقائياً لأنها تحمل classes مختلفة
-    """
     soup = BeautifulSoup(html, "html.parser")
 
     results = []
@@ -166,7 +164,6 @@ def extract_structure(html):
 
     for h in soup.find_all("h5"):
         classes = h.get("class", [])
-        # يجب أن يحتوي على default-text-color ولا يحتوي على modal-title
         if "default-text-color" not in classes:
             continue
         if "modal-title" in classes:
