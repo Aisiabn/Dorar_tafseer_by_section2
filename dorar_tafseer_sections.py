@@ -1,11 +1,11 @@
 """
 موسوعة التفسير — dorar.net
 المخرج: ملف Markdown منفصل لكل عنوان فرعي (span.title-1)
-كل segment يستخرج حواشيه بشكل مستقل — لا مشاركة بين الأقسام
+الحواشي مستخرجة بـ find_all recursive قبل أي معالجة أخرى
 """
 
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
 import re, time, os, traceback
 from difflib import SequenceMatcher
 
@@ -20,8 +20,12 @@ TEST_SURAHS = None if _val == "None" else int(_val)
 SURAH_RE   = re.compile(r"^/tafseer/(\d+)$")
 SECTION_RE = re.compile(r"^/tafseer/(\d+)/(\d+)$")
 TASHKEEL   = re.compile(
-    r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]'
+    r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC'
+    r'\u06DF-\u06E4\u06E7\u06E8\u06EA-\u06ED]'
 )
+
+_TIP_RE = re.compile(r'\x01(\d+)\x01')
+_T1_RE  = re.compile(r'\x02(.*?)\x03', re.DOTALL)
 
 # ─────────────────────────────────────────────
 # أدوات مساعدة
@@ -127,49 +131,6 @@ def get_page_title(html):
     return ""
 
 # ─────────────────────────────────────────────
-# معالجة nodes مستقلة لكل segment
-# ─────────────────────────────────────────────
-def process_nodes(nodes):
-    """
-    يحوّل قائمة nodes مباشرة إلى (text, footnotes).
-    الحواشي مرقّمة محلياً من 1 — مستقلة تماماً عن باقي الأقسام.
-    """
-    fn_counter = 1
-    footnotes  = []
-    parts      = []
-
-    for node in nodes:
-        if isinstance(node, NavigableString):
-            parts.append(str(node))
-        elif isinstance(node, Tag):
-            cls = node.get("class", [])
-            if node.name == "br":
-                parts.append("\n")
-            elif "tip" in cls:
-                fn_text = node.get_text(strip=True)
-                if fn_text:
-                    footnotes.append(f"[^{fn_counter}]: {fn_text}")
-                    parts.append(f" [^{fn_counter}]")
-                    fn_counter += 1
-            elif "aaya" in cls:
-                parts.append(f"﴿{node.get_text(strip=True)}﴾")
-            elif "hadith" in cls:
-                parts.append(f"«{node.get_text(strip=True)}»")
-            elif "sora" in cls:
-                t = node.get_text(strip=True)
-                if t:
-                    parts.append(f" {t} ")
-            elif "title-1" in cls:
-                pass  # لا يجب أن يصل هنا
-            else:
-                parts.append(node.get_text(" ", strip=False))
-
-    text = "".join(parts)
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
-    return text, footnotes
-
-# ─────────────────────────────────────────────
 # استخراج الأقسام من صفحة
 # ─────────────────────────────────────────────
 def extract_title1_blocks(html):
@@ -186,42 +147,73 @@ def extract_title1_blocks(html):
         if not p:
             continue
 
-        # جمع كل title-1 مباشرة في p
-        t1_spans = [
-            n for n in p.children
-            if isinstance(n, Tag) and "title-1" in n.get("class", [])
-        ]
-        if not t1_spans:
-            continue
+        # ── 1. استبدال كل span.tip بعلامة \x01N\x01 (recursive يشمل المتداخلة) ──
+        tips_map    = {}
+        tip_counter = 1
+        for tip in p.find_all("span", class_="tip"):
+            tip_text = tip.get_text(strip=True)
+            if tip_text:
+                tips_map[tip_counter] = tip_text
+                tip.replace_with(f"\x01{tip_counter}\x01")
+                tip_counter += 1
+            else:
+                tip.decompose()
 
-        # بناء خريطة: t1_span → الـ nodes التي تليه حتى t1 التالي
-        t1_set = set(id(s) for s in t1_spans)
+        # ── 2. علّم title-1 بعلامات \x02...\x03 ──
+        for span in p.find_all("span", class_="title-1"):
+            span.replace_with(f"\x02{span.get_text(strip=True)}\x03")
 
-        for idx, t1 in enumerate(t1_spans):
-            title_text = t1.get_text(strip=True)
-            if not title_text:
+        # ── 3. تحويل باقي العناصر ──
+        for span in p.find_all("span", class_="aaya"):
+            span.replace_with(f"﴿{span.get_text(strip=True)}﴾")
+        for span in p.find_all("span", class_="hadith"):
+            span.replace_with(f"«{span.get_text(strip=True)}»")
+        for span in p.find_all("span", class_="sora"):
+            t = span.get_text(strip=True)
+            if t:
+                span.replace_with(f" {t} ")
+        for br in p.find_all("br"):
+            br.replace_with("\n")
+
+        # ── 4. استخرج النص وقسّمه على title-1 ──
+        raw   = p.get_text(separator="")
+        raw   = re.sub(r'[ \t]+', ' ', raw)
+        parts = _T1_RE.split(raw)
+        # parts = [نص_قبل_أول_t1, عنوان1, نص1, عنوان2, نص2, ...]
+
+        i = 1
+        while i + 1 < len(parts):
+            title_text = parts[i].strip()
+            seg_raw    = parts[i + 1]
+            i += 2
+
+            if not title_text or not seg_raw.strip():
                 continue
 
-            # اجمع siblings حتى t1 التالي
-            seg_nodes = []
-            node = t1.next_sibling
-            while node is not None:
-                if isinstance(node, Tag) and id(node) in t1_set:
-                    break
-                seg_nodes.append(node)
-                node = node.next_sibling
+            # ── 5. استخرج الحواشي الخاصة بهذا القسم فقط ──
+            local_fn  = 1
+            local_fns = []
+            seen_tips = {}
 
-            text, footnotes = process_nodes(seg_nodes)
-            if not text:
-                continue
+            def replace_tip(m):
+                nonlocal local_fn
+                tid = int(m.group(1))
+                if tid not in seen_tips:
+                    seen_tips[tid] = local_fn
+                    local_fns.append(f"[^{local_fn}]: {tips_map.get(tid, '')}")
+                    local_fn += 1
+                return f" [^{seen_tips[tid]}]"
+
+            seg_text = _TIP_RE.sub(replace_tip, seg_raw)
+            seg_text = re.sub(r'\n{3,}', '\n\n', seg_text).strip()
 
             key = fuzzy_key(title_text)
             blocks.append({
                 "key"      : key,
                 "display"  : title_text,
                 "l3"       : l3_heading,
-                "text"     : text,
-                "footnotes": footnotes,
+                "text"     : seg_text,
+                "footnotes": local_fns,
             })
 
     return blocks
@@ -231,8 +223,8 @@ def extract_title1_blocks(html):
 # ─────────────────────────────────────────────
 def renum(text, fns, global_fn):
     """
-    الحواشي محلية [^1],[^2],... — نعيد ترقيمها عالمياً.
-    كل رقم في النص له بالضرورة تعريف في fns لأنهما أُنشئا معاً.
+    الحواشي محلية [^1],[^2],... مضمون وجودها في النص.
+    نعيد ترقيمها عالمياً متسلسلاً.
     """
     local_map = {}
     for fn in fns:
@@ -353,7 +345,8 @@ def save_db(db):
         with open(fpath, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        print(f"  ✔ {safe_filename(display)}.md  ({len(entries)} مقطع، {len(all_footnotes)} حاشية)")
+        print(f"  ✔ {safe_filename(display)}.md  "
+              f"({len(entries)} مقطع، {len(all_footnotes)} حاشية)")
 
     print(f"\n✔ {len(db)} ملف في {OUT_DIR}/")
 
