@@ -1,7 +1,12 @@
-name: Dorar Structure Extractor
+name: Dorar Tafseer Sections Extractor
 
 on:
   workflow_dispatch:
+    inputs:
+      test_surahs:
+        description: 'عدد السور للاختبار (اتركه فارغاً للكل)'
+        required: false
+        default: 'None'
 
 permissions:
   contents: write
@@ -23,28 +28,29 @@ jobs:
         run: pip install requests beautifulsoup4
 
       - name: Run scraper
-        run: python dorar_structure.py
+        run: python dorar_tafseer_sections.py
         env:
-          TEST_SURAHS: "None"
+          TEST_SURAHS: ${{ github.event.inputs.test_surahs || 'None' }}
 
       - name: Verify output
         run: |
-          if [ ! -d "dorar_structure" ] || [ -z "$(ls -A dorar_structure)" ]; then
-            echo "ERROR: dorar_structure مفقود أو فارغ"
+          if [ ! -d "dorar_tafseer_sections" ] || [ -z "$(ls -A dorar_tafseer_sections)" ]; then
+            echo "ERROR: dorar_tafseer_sections مفقود أو فارغ"
             ls -la
             exit 1
           fi
-          echo "✔ عدد الملفات: $(ls dorar_structure/ | wc -l)"
+          echo "✔ عدد الملفات: $(ls dorar_tafseer_sections/ | wc -l)"
 
       - name: Compress results
-        run: zip -r dorar_structure.zip dorar_structure/
+        run: zip -r dorar_tafseer_sections.zip dorar_tafseer_sections/
 
       - name: Commit and push results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dorar_structure.zip
+          git pull --rebase origin main
+          git add dorar_tafseer_sections.zip
           git diff --cached --quiet || (
-            git commit -m "update: structure extracted $(date +'%Y-%m-%d')" &&
+            git commit -m "update: tafseer sections extracted $(date +'%Y-%m-%d')" &&
             git push
           )
