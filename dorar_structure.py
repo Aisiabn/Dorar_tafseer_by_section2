@@ -13,7 +13,7 @@ from difflib import SequenceMatcher
 BASE    = "https://dorar.net"
 INDEX   = "https://dorar.net/tafseer"
 DELAY   = 1.2
-OUT_DIR = "dorar_tafseer_sections"
+OUT_DIR = "dorar_structure"
 
 _val        = os.environ.get("TEST_SURAHS", "None")
 TEST_SURAHS = 1 if _val == "None" else int(_val)
