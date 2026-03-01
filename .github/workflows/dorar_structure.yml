@@ -51,5 +51,6 @@ jobs:
           git add dorar_tafseer_sections.zip
           git diff --cached --quiet || (
             git commit -m "update: tafseer sections extracted $(date +'%Y-%m-%d')" &&
+            git pull origin main --no-rebase -X ours &&
             git push
           )
