@@ -1,13 +1,13 @@
 """
 موسوعة التفسير — dorar.net
-المخرج: ملف Markdown منفصل لكل قسم (L3)
-المحتوى منظم: السورة → المقطع → عنوان فرعي (title-1) → النص
+المخرج: ملف Markdown منفصل لكل قسم (L3/h5)
+المحتوى: السورة → المقطع → عنوان فرعي (span.title-1) → النص
 الحواشي مجمّعة في نهاية كل ملف
 """
 
 import requests
-from bs4 import BeautifulSoup
-import re, time, os, json, traceback
+from bs4 import BeautifulSoup, NavigableString, Tag
+import re, time, os, traceback
 from difflib import SequenceMatcher
 
 BASE    = "https://dorar.net"
@@ -26,7 +26,7 @@ TASHKEEL = re.compile(
 )
 
 # ─────────────────────────────────────────────
-# مفاتيح التجميع الذكي
+# أدوات مساعدة
 # ─────────────────────────────────────────────
 _known_keys: list = []
 
@@ -125,184 +125,147 @@ def get_page_title(html):
     soup = BeautifulSoup(html, "html.parser")
     og   = soup.find("meta", property="og:title")
     if og and og.get("content"):
-        parts = og["content"].split(" - ", 1)
-        return parts[-1].strip()
+        return og["content"].split(" - ", 1)[-1].strip()
     t = soup.find("title")
     if t:
         return t.get_text().split(" - ")[-1].strip()
     return ""
 
 # ─────────────────────────────────────────────
-# استخراج المحتوى
+# استخراج الحواشي من span.tip
 # ─────────────────────────────────────────────
-NOTE_RE = re.compile(
-    r'\[(\d+)\]\s*'
-    r'((?:يُنظَر|يُنظر|انظر|ينظر|راجع|أخرجه|رواه)[^\[]*(?:\[[^\]]*\][^\[]*)*)',
-    re.UNICODE
-)
+TIP_NUM_RE = re.compile(r'^\[(\d+)\]')
 
-def extract_footnotes_from_tips(soup_elem):
-    """استخراج الحواشي من span.tip"""
-    notes = {}
-    for span in soup_elem.find_all("span", class_="tip"):
+def extract_tips(p_tag):
+    """
+    يستخرج الحواشي من span.tip داخل <p>،
+    ويستبدل كل span.tip بـ [^N] في النص.
+    يعيد (footnotes: dict, p_tag معدّل نسخياً)
+    """
+    footnotes = {}
+    for span in p_tag.find_all("span", class_="tip"):
         raw = span.get_text(" ", strip=True)
-        m   = NOTE_RE.search(raw)
+        m   = TIP_NUM_RE.match(raw)
         if m:
             num  = m.group(1)
-            body = re.sub(r'\s+', ' ', m.group(2)).strip()
-            notes[num] = body
-        span.replace_with(f" [{span.get_text(strip=True).split(']')[0].lstrip('[').strip()}]^fn ")
-    return notes
+            body = re.sub(r'\s+', ' ', raw[len(m.group(0)):]).strip()
+            footnotes[num] = body
+            span.replace_with(f"[^{num}]")
+        else:
+            span.decompose()
+    return footnotes
 
-def clean_text(elem) -> str:
-    """تنظيف النص من عناصر الواجهة"""
-    for tag in elem.find_all(["script", "style", "nav", "footer", "button"]):
-        tag.decompose()
-    # إزالة روابط المصدر الخارجية (fa-external-link)
-    for a in elem.find_all("a"):
-        if a.find("i", class_="fa-external-link"):
-            a.decompose()
-    text = elem.get_text(" ", strip=True)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
+# ─────────────────────────────────────────────
+# تحليل <p> إلى شرائح (subheading + text)
+# ─────────────────────────────────────────────
+def parse_paragraph(p_tag):
+    """
+    يقرأ محتوى <p> node بnode،
+    ويقسّمه على span.title-1 كعناوين فرعية.
+    يعيد قائمة: [{"type": "subheading"|"text", "text": "..."}]
+    """
+    chunks   = []
+    buf      = []
 
+    def flush_buf():
+        t = re.sub(r'\s+', ' ', " ".join(buf)).strip()
+        if t:
+            chunks.append({"type": "text", "text": t})
+        buf.clear()
+
+    for node in p_tag.children:
+        if isinstance(node, NavigableString):
+            s = str(node).strip()
+            if s:
+                buf.append(s)
+        elif isinstance(node, Tag):
+            if node.name == "span" and "title-1" in node.get("class", []):
+                flush_buf()
+                heading = node.get_text(strip=True)
+                if heading:
+                    chunks.append({"type": "subheading", "text": heading})
+            elif node.name == "br":
+                buf.append(" ")
+            else:
+                # أي عنصر آخر (aaya, sora, hadith, ...) نأخذ نصه
+                t = node.get_text(" ", strip=True)
+                if t:
+                    buf.append(t)
+
+    flush_buf()
+    return chunks
+
+# ─────────────────────────────────────────────
+# استخراج الأقسام من صفحة
+# ─────────────────────────────────────────────
 def extract_sections(html):
     """
-    يعيد قائمة من الأقسام:
+    يعيد قائمة أقسام من صفحة واحدة:
     [
       {
-        "l3"      : "تفسير الآيات",
-        "l3_key"  : "...",
-        "content" : [
-          {"type": "heading", "text": "مناسبة الآية لما قبلها"},
-          {"type": "text",    "text": "..."},
-          ...
-        ],
-        "footnotes": {"1": "...", "2": "..."}
+        "l3"       : "تفسير الآيات",
+        "l3_key"   : "...",
+        "chunks"   : [{"type": "subheading"|"text", "text": "..."}],
+        "footnotes": {"26": "يُنظر: ...", ...}
       },
       ...
     ]
     """
     soup     = BeautifulSoup(html, "html.parser")
     sections = []
-    seen_h5  = set()
+    seen     = set()
 
-    all_h5 = [
-        h for h in soup.find_all("h5")
-        if "default-text-color" in h.get("class", [])
-        and "modal-title" not in h.get("class", [])
-        and not any(c in h.get("class", []) for c in ["th5-responsive", "ext-uppercase"])
-    ]
+    # كل قسم داخل <article>
+    for article in soup.find_all("article", class_="border-bottom"):
+        h5 = article.find("h5", class_="default-text-color")
+        if not h5:
+            continue
+        if "modal-title" in h5.get("class", []):
+            continue
 
-    for idx, h5 in enumerate(all_h5):
         heading = h5.get_text(strip=True)
         if not heading:
             continue
+
         l3_key = fuzzy_key(heading)
-        if l3_key in seen_h5:
+        if l3_key in seen:
             continue
-        seen_h5.add(l3_key)
+        seen.add(l3_key)
 
-        # جمع siblings حتى h5 التالي
-        sibs = []
-        for sib in h5.find_next_siblings():
-            if sib.name == "h5" and "default-text-color" in sib.get("class", []):
-                break
-            sibs.append(sib)
+        p = article.find("p")
+        if not p:
+            continue
 
-        # بناء عنصر مؤقت لاستخراج الحواشي
-        from bs4 import Tag
-        wrapper = BeautifulSoup("", "html.parser")
-        container = wrapper.new_tag("div")
-        for s in sibs:
-            container.append(s.__copy__())
-        wrapper.append(container)
+        # استخراج الحواشي أولاً (يعدّل p في المكان)
+        footnotes = extract_tips(p)
 
-        footnotes = extract_footnotes_from_tips(container)
-
-        # تقطيع المحتوى على span.title-1
-        content = []
-        current_title = None
-        buf = []
-
-        def flush(title, buf):
-            txt = " ".join(buf).strip()
-            txt = re.sub(r'\s+', ' ', txt)
-            if txt:
-                content.append({"type": "heading" if title else "text",
-                                 "text": title or txt,
-                                 "body": txt if title else None})
-            elif title:
-                content.append({"type": "heading", "text": title, "body": ""})
-
-        for sib in container.children:
-            if not hasattr(sib, "find_all"):
-                t = str(sib).strip()
-                if t:
-                    buf.append(t)
-                continue
-
-            # ابحث عن title-1 داخل العنصر
-            spans = sib.find_all("span", class_="title-1")
-            if spans:
-                # قد يكون في نفس العنصر نص قبل الـ span وبعده
-                for span in spans:
-                    # النص قبل الـ span
-                    before = span.find_previous_sibling(string=True)
-                    if current_title is None and buf:
-                        txt = clean_text(sib).split(span.get_text(strip=True))[0].strip()
-                        if txt:
-                            buf.append(txt)
-                    # احفظ الـ buffer السابق
-                    if current_title is not None or buf:
-                        b = " ".join(buf).strip()
-                        if current_title:
-                            content.append({"type": "subheading", "text": current_title})
-                        if b:
-                            content.append({"type": "text", "text": b})
-                        buf = []
-                    current_title = span.get_text(strip=True)
-            else:
-                txt = clean_text(sib)
-                if txt:
-                    buf.append(txt)
-
-        # الـ buffer المتبقي
-        if current_title:
-            content.append({"type": "subheading", "text": current_title})
-        if buf:
-            content.append({"type": "text", "text": " ".join(buf).strip()})
+        # تقطيع المحتوى
+        chunks = parse_paragraph(p)
 
         sections.append({
             "l3"       : heading,
             "l3_key"   : l3_key,
-            "content"  : content,
+            "chunks"   : chunks,
             "footnotes": footnotes,
         })
 
     return sections
 
 # ─────────────────────────────────────────────
-# هيكل التجميع
-# sections_db[l3_key] = {
-#   "display" : "تفسير الآيات",
-#   "entries" : [
-#     {"surah": "الفاتحة", "page_title": "...", "content": [...], "footnotes": {...}},
-#     ...
-#   ]
-# }
+# قاعدة التجميع
 # ─────────────────────────────────────────────
 def build_db():
     return {}
 
-def register(db, l3_key, display, surah_title, page_title, content, footnotes):
-    if l3_key not in db:
-        db[l3_key] = {"display": display, "entries": []}
-    db[l3_key]["entries"].append({
+def register(db, sec, surah_title, page_title):
+    k = sec["l3_key"]
+    if k not in db:
+        db[k] = {"display": sec["l3"], "entries": []}
+    db[k]["entries"].append({
         "surah"      : surah_title,
         "page_title" : page_title,
-        "content"    : content,
-        "footnotes"  : footnotes,
+        "chunks"     : sec["chunks"],
+        "footnotes"  : sec["footnotes"],
     })
 
 # ─────────────────────────────────────────────
@@ -319,18 +282,15 @@ def crawl(session, surah_links):
         print(f"\n{'='*55}")
         print(f"[{snum:3d}] {stitle}")
 
-        html_surah = get_page(session, surl, referer=INDEX)
+        html_s = get_page(session, surl, referer=INDEX)
         time.sleep(DELAY)
-        if not html_surah:
+        if not html_s:
             continue
 
-        # صفحة السورة الرئيسية
-        for sec in extract_sections(html_surah):
-            register(db, sec["l3_key"], sec["l3"],
-                     stitle, f"تعريف {stitle}",
-                     sec["content"], sec["footnotes"])
+        for sec in extract_sections(html_s):
+            register(db, sec, stitle, f"تعريف {stitle}")
 
-        first_url = get_first_section_link(html_surah, snum)
+        first_url = get_first_section_link(html_s, snum)
         if not first_url:
             print("  ⚠ لا مقاطع")
             continue
@@ -340,65 +300,68 @@ def crawl(session, surah_links):
 
         while next_url and next_url not in visited:
             visited.add(next_url)
-            html_sec = get_page(session, next_url, referer=surl)
+            html_p = get_page(session, next_url, referer=surl)
             time.sleep(DELAY)
-            if not html_sec:
+            if not html_p:
                 break
 
-            page_title = get_page_title(html_sec)
-            secs       = extract_sections(html_sec)
+            ptitle = get_page_title(html_p)
+            secs   = extract_sections(html_p)
             for sec in secs:
-                register(db, sec["l3_key"], sec["l3"],
-                         stitle, page_title,
-                         sec["content"], sec["footnotes"])
-                print(f"    {page_title[:35]:35s}  → {sec['l3'][:30]}")
+                register(db, sec, stitle, ptitle)
+                print(f"    {ptitle[:35]:35s}  → {sec['l3'][:30]}")
 
-            next_url = get_next_link(html_sec)
+            next_url = get_next_link(html_p)
 
     return db
 
 # ─────────────────────────────────────────────
 # الحفظ
 # ─────────────────────────────────────────────
-def render_content(content, fn_offset=0):
+def render_entry(entry, fn_counter):
     """
-    يحوّل قائمة content إلى نص Markdown.
-    fn_offset: لتجنب تكرار أرقام الحواشي عبر المقاطع
-    يعيد (text, fn_offset_new)
+    يحوّل entry واحد إلى نص Markdown مع إعادة ترقيم الحواشي.
+    يعيد (lines, fn_counter_new, [(glob_num, body), ...])
     """
-    lines = []
-    fn_map   = {}   # رقم أصلي → رقم جديد عالمي
-    fn_counter = fn_offset
+    fn_map     = {}   # رقم أصلي → رقم عالمي جديد
+    collected  = []   # [(glob_num, body)]
+    lines      = []
 
-    def remap(match):
-        nonlocal fn_counter
-        orig = match.group(1)
+    def remap(m):
+        orig = m.group(1)
         if orig not in fn_map:
+            nonlocal fn_counter
             fn_counter += 1
             fn_map[orig] = fn_counter
+            body = entry["footnotes"].get(orig, "")
+            collected.append((fn_counter, body))
         return f"[^{fn_map[orig]}]"
 
-    for item in content:
-        if item["type"] == "subheading":
-            lines.append(f"\n#### {item['text']}\n")
-        elif item["type"] == "text":
-            txt = re.sub(r'\[(\d+)\]\^fn', remap, item["text"])
-            lines.append(f"\n{txt}\n")
+    for chunk in entry["chunks"]:
+        if chunk["type"] == "subheading":
+            lines.append(f"\n#### {chunk['text']}\n")
+        else:
+            txt = re.sub(r'\[\^(\d+)\]', remap, chunk["text"])
+            txt = re.sub(r'\s+', ' ', txt).strip()
+            if txt:
+                lines.append(f"\n{txt}\n")
 
-    return "\n".join(lines), fn_counter, fn_map
+    return lines, fn_counter, collected
+
 
 def save_db(db):
     os.makedirs(OUT_DIR, exist_ok=True)
 
     for l3_key, info in db.items():
-        display  = info["display"]
-        entries  = info["entries"]
-        fname    = safe_filename(display) + ".md"
-        fpath    = os.path.join(OUT_DIR, fname)
+        display = info["display"]
+        entries = info["entries"]
+        fname   = safe_filename(display) + ".md"
+        fpath   = os.path.join(OUT_DIR, fname)
 
-        all_footnotes = []   # [(num_global, body)]
-        fn_offset     = 0
-        lines         = [
+        all_footnotes = []
+        fn_counter    = 0
+
+        lines = [
             f"# {display}\n\n",
             f"> المصدر: موسوعة التفسير — dorar.net  \n",
             f"> عدد المقاطع: {len(entries)}\n\n",
@@ -413,23 +376,14 @@ def save_db(db):
 
             lines.append(f"### {entry['page_title']}\n")
 
-            body, fn_offset, fn_map = render_content(entry["content"], fn_offset)
-            lines.append(body)
-            lines.append("\n")
+            body_lines, fn_counter, collected = render_entry(entry, fn_counter)
+            lines.extend(body_lines)
+            all_footnotes.extend(collected)
+            lines.append("\n---\n\n")
 
-            # اجمع الحواشي مع إعادة الترقيم
-            rev_map = {v: k for k, v in fn_map.items()}
-            for glob_num in sorted(rev_map.keys()):
-                orig_num = rev_map[glob_num]
-                if orig_num in entry["footnotes"]:
-                    all_footnotes.append((glob_num, entry["footnotes"][orig_num]))
-
-            lines.append("---\n\n")
-
-        # الحواشي في النهاية
         if all_footnotes:
             lines.append("\n## الحواشي\n\n")
-            for num, body in sorted(all_footnotes):
+            for num, body in sorted(all_footnotes, key=lambda x: x[0]):
                 lines.append(f"[^{num}]: {body}\n")
 
         with open(fpath, "w", encoding="utf-8") as f:
